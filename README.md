@@ -29,7 +29,8 @@ Every call passes these, and the server refuses at the first one that fails:
    - every message is read back before it goes, the way a mail server reads it, and refused unless its recipients and subject are exactly the ones in the call (Python decodes `=?...?=` encoded words as it writes a message);
    - no hidden characters in anything sent;
    - a `reply`, and a draft made as a reply, goes only to people already on the message;
-   - `send_draft` must restate the draft's To, Cc, Bcc and subject;
+   - `from` picks the address it goes out from, and must be one of the mailbox's verified send-as addresses (`check_settings` lists them, and the server reads them afresh on every call); left out, it's the mailbox's own address;
+   - `send_draft` must restate the draft's To, Cc, Bcc and subject, and its `from` when that isn't the mailbox's own address (`get_draft` shows it as `sendsFrom`);
    - `forward_message` sends attachments only with `includeAttachments: true`.
 7. **Claude changes only its own drafts.** Drafts the server makes carry a header that signs everything the draft would send. Your drafts, or one of its drafts you've since edited in Gmail, can be read but not changed, deleted or sent from here, and the message tools refuse a draft's message id. `adopt_draft` hands one over, so Claude can then work on it like its own: the call must restate the draft's To, Cc, Bcc and subject, so its approval names the draft, and the draft is kept as you left it (editing or sending it from here makes it plain text, dropping its formatting; a draft holding anything more, such as attachments or inline images, is refused by `update_draft` and `send_draft`, so nothing is dropped without your seeing it). Set it to *Needs approval* like the other draft tools.
 8. **Hourly limits, shared by every copy of the server** through a DynamoDB table:

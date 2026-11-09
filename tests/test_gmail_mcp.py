@@ -607,6 +607,105 @@ class Server(Http, unittest.TestCase):
         self.assertIn(b"Bcc: b@example.org", raw)
         self.assertNotIn(d["draftId"], self.me.drafts)
 
+    # From: the mailbox's send-as addresses.
+
+    def add_send_as(self, address, status="accepted", name="Club Board"):
+        self.me.settings["sendAs"]["sendAs"].append({"sendAsEmail": address, "displayName": name,
+                                                      "treatAsAlias": True, "verificationStatus": status})
+
+    def test_from_a_verified_send_as_address(self):
+        self.add_send_as("board@club.example")
+        err, r = self.tool("send_message", to=["a@example.com"], subject="Minutes", body="Attached soon.",
+                           **{"from": "Board@Club.example"})
+        self.assertFalse(err, r)
+        raw = self.me.sent[0][1]
+        self.assertIn(b"From: Club Board <board@club.example>", raw)
+        self.assertEqual(server.store().audits[-1]["from"], "board@club.example")
+        # The mailbox's own address, or none, leaves From to Gmail.
+        for args in ({"from": ME}, {}):
+            err, r = self.tool("send_message", to=["a@example.com"], subject="Hi", body="x", **args)
+            self.assertFalse(err, r)
+            self.assertNotIn(b"From:", self.me.sent[-1][1])
+            self.assertNotIn("from", server.store().audits[-1])
+
+    def test_from_anything_else_is_refused(self):
+        self.add_send_as("pending@club.example", status="pending")
+        for addr, why in (("stranger@evil.example", "isn't one of"), ("pending@club.example", "isn't verified"),
+                          ("Board <board@club.example>", "isn't a plain email address")):
+            self.refused("send_message", why, to=["a@example.com"], subject="Hi", body="x", **{"from": addr})
+            self.refused("create_draft", why, to=["a@example.com"], subject="Hi", body="x", **{"from": addr})
+        self.assertEqual(self.me.sent, [])
+        self.assertEqual(self.me.drafts, {})
+
+    def test_a_display_name_cant_add_an_address(self):
+        self.add_send_as("board@club.example", name='Evil" <x@evil.example>, "y')
+        err, r = self.tool("send_message", to=["a@example.com"], subject="Hi", body="x",
+                           **{"from": "board@club.example"})
+        self.assertFalse(err, r)
+        back = mail.parse_raw(base64.urlsafe_b64encode(self.me.sent[0][1]).decode())
+        self.assertEqual(mail.addresses(back, "From"), ["board@club.example"])
+
+    def test_reply_and_forward_from_a_send_as_address(self):
+        self.add_send_as("board@club.example")
+        orig = next(m for m in self.me.messages.values() if "DRAFT" not in m.get("labelIds", []))
+        hs = {h["name"].lower(): h["value"] for h in orig["payload"]["headers"]}
+        sender = mail.addresses(mail.parse_raw(base64.urlsafe_b64encode(
+            f"From: {hs['from']}\r\n\r\n".encode()).decode()), "From")[0]
+        err, r = self.tool("reply", messageId=orig["id"], to=[sender], body="Thanks", **{"from": "board@club.example"})
+        self.assertFalse(err, r)
+        self.assertIn(b"From: Club Board <board@club.example>", self.me.sent[-1][1])
+        err, r = self.tool("forward_message", messageId=orig["id"], to=["b@example.org"],
+                           **{"from": "board@club.example"})
+        self.assertFalse(err, r)
+        self.assertIn(b"From: Club Board <board@club.example>", self.me.sent[-1][1])
+
+    def test_a_drafts_from_is_signed_shown_and_restated(self):
+        self.add_send_as("board@club.example")
+        self.add_send_as("other@club.example", name="Other")
+        err, d = self.tool("create_draft", to=["a@example.com"], subject="Agenda", body="Items",
+                           **{"from": "board@club.example"})
+        self.assertFalse(err, d)
+        err, got = self.tool("get_draft", draftId=d["draftId"])
+        self.assertEqual(got["sendsFrom"], "board@club.example")
+        self.assertTrue(got["madeByThisServer"])
+        # send_draft must say where it goes out from.
+        self.refused("send_draft", "From isn't what this call says", draftId=d["draftId"], to=["a@example.com"],
+                     subject="Agenda")
+        self.refused("send_draft", "From isn't what this call says", draftId=d["draftId"], to=["a@example.com"],
+                     subject="Agenda", **{"from": "other@club.example"})
+        self.assertEqual(self.me.sent, [])
+        # A From changed in Gmail, even to another of the mailbox's addresses, breaks the marker.
+        raw = self.me.drafts[d["draftId"]]["message"]["raw"]
+        moved = mail.parse_raw(raw)
+        moved.replace_header("From", "Other <other@club.example>")
+        self.me.drafts[d["draftId"]]["message"]["raw"] = mail.raw(moved)
+        self.refused("send_draft", "wasn't made by this server", draftId=d["draftId"], to=["a@example.com"],
+                     subject="Agenda", **{"from": "other@club.example"})
+        self.me.drafts[d["draftId"]]["message"]["raw"] = raw
+        err, s = self.tool("send_draft", draftId=d["draftId"], to=["a@example.com"], subject="Agenda",
+                           **{"from": "board@club.example"})
+        self.assertFalse(err, s)
+        self.assertIn(b"From: Club Board <board@club.example>", self.me.sent[-1][1])
+        # update_draft without from goes back to the mailbox's own address.
+        err, d2 = self.tool("create_draft", to=["a@example.com"], subject="Two", body="x",
+                            **{"from": "board@club.example"})
+        err, u = self.tool("update_draft", draftId=d2["draftId"], to=["a@example.com"], subject="Two", body="y")
+        self.assertFalse(err, u)
+        err, got = self.tool("get_draft", draftId=d2["draftId"])
+        self.assertEqual(got["sendsFrom"], ME)
+
+    def test_gmails_own_from_on_a_stored_draft_keeps_the_marker(self):
+        err, d = self.tool("create_draft", to=["a@example.com"], subject="Hi", body="x")
+        stored = mail.parse_raw(self.me.drafts[d["draftId"]]["message"]["raw"])
+        stored["From"] = f"Me <{ME}>"   # as Gmail writes on every draft it stores
+        self.me.drafts[d["draftId"]]["message"]["raw"] = mail.raw(stored)
+        err, got = self.tool("get_draft", draftId=d["draftId"])
+        self.assertTrue(got["madeByThisServer"])
+        self.assertEqual(got["sendsFrom"], ME)
+        err, s = self.tool("send_draft", draftId=d["draftId"], to=["a@example.com"], subject="Hi")
+        self.assertFalse(err, s)
+        self.assertNotIn(b"From:", self.me.sent[-1][1])
+
     # Sending.
 
     def test_send_message_sends_plain_text_and_labels_it(self):

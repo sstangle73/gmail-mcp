@@ -30,6 +30,7 @@ import re
 import time
 import unicodedata
 from dataclasses import dataclass, field
+from email.headerregistry import Address
 from email.message import EmailMessage
 from typing import Any, Awaitable, Callable
 
@@ -167,6 +168,7 @@ class Call:
     args: dict[str, Any]
     ids: list[str] = field(default_factory=list)       # for the audit entry
     domains: list[str] = field(default_factory=list)
+    sender: str = ""   # a send-as address the call goes out from (_sender); empty for the mailbox's own
 
     gated: bool = False
 
@@ -313,7 +315,8 @@ def draft_marker(account: server.Account, msg: EmailMessage) -> str:
     wrote, or kept on one whose recipients were changed in Gmail, it no longer matches (security review,
     2026-11-08)."""
     key = server.config().signin.signing_key.encode()
-    return hmac.new(key, b"draft\0" + account.address.encode() + b"\0" + mail.fingerprint(msg, MARKER),
+    return hmac.new(key, b"draft\0" + account.address.encode() + b"\0" + mail.fingerprint(msg, MARKER,
+                                                                                          account.address),
                     hashlib.sha256).hexdigest()[:40]
 
 
@@ -342,11 +345,45 @@ async def _own_draft(c: Call, draft_id: str) -> tuple[dict, EmailMessage]:
     return d, msg
 
 
+async def _sender(c: Call) -> str | None:
+    """The From header for the call's "from": None for the mailbox's own address (Gmail sets it), else one of the
+    mailbox's send-as addresses that Gmail lists as verified, with its display name: say, a club's mail sent from
+    the alias the club knows."""
+    want = str(c.arg("from") or "").strip()
+    if not want or want.lower() == c.account.address:
+        return None
+    if not mail.ADDRESS.fullmatch(want):
+        raise Refused(f"from isn't a plain email address: {want[:80]!r}")
+    try:
+        listed = await c.g.api("GET", "settings/sendAs")
+    except UpstreamError as e:
+        raise Refused(f"couldn't read {c.account.address}'s send-as addresses ({e})") from None
+    for s in listed.get("sendAs") or []:
+        addr = str(s.get("sendAsEmail") or "").strip()
+        if addr.lower() != want.lower():
+            continue
+        if not (s.get("isPrimary") or s.get("verificationStatus") == "accepted"):
+            raise Refused(f"{addr} isn't verified as a send-as address of {c.account.address}")
+        if not mail.ADDRESS.fullmatch(addr):
+            raise Refused(f"{addr[:80]!r} can't be used as a From address here")
+        c.sender = addr.lower()
+        name = " ".join(mail.clean(str(s.get("displayName") or "")).split())[:100]
+        return str(Address(display_name=name, addr_spec=addr)) if name else addr
+    raise Refused(f"{want} isn't one of {c.account.address}'s send-as addresses (check_settings lists them)")
+
+
+def _draft_sender(account: server.Account, msg: EmailMessage) -> str:
+    """The send-as address a draft goes out from, or "" for the mailbox's own (Gmail writes that on every draft)."""
+    got = [a for a in mail.addresses(msg, "From") if a != account.address]
+    return got[0] if got else ""
+
+
 def _built(c: Call, msg: EmailMessage, who: dict[str, list[str]], subject: str) -> EmailMessage:
     """msg, once it's checked to go out exactly as approved: read back the way a mail server reads it, with the
-    recipients and subject the call gave and no others (security review, 2026-11-08: an encoded word in an address
-    or subject is decoded as the message is written)."""
-    problem = mail.built_problem(msg, who.get("to", []), who.get("cc", []), who.get("bcc", []), subject)
+    recipients, subject and From the call gave and no others (security review, 2026-11-08: an encoded word in an
+    address or subject is decoded as the message is written)."""
+    problem = mail.built_problem(msg, who.get("to", []), who.get("cc", []), who.get("bcc", []), subject,
+                                 c.sender or None)
     if problem:
         raise Refused(problem)
     return msg
@@ -468,6 +505,7 @@ async def list_drafts(c: Call) -> Any:
             full, msg = await _raw_draft(c, d["id"])
         m = full.get("message") or {}
         return {"draftId": d["id"], "messageId": m.get("id"), "threadId": m.get("threadId"),
+                "from": _draft_sender(c.account, msg) or c.account.address,
                 "to": ", ".join(mail.addresses(msg, "To")), "cc": ", ".join(mail.addresses(msg, "Cc")),
                 "bcc": ", ".join(mail.addresses(msg, "Bcc")), "subject": str(msg.get("Subject", "")),
                 "snippet": m.get("snippet", ""), "madeByThisServer": made_here(c.account, msg)}
@@ -485,7 +523,8 @@ async def get_draft(c: Call) -> Any:
     # The recipients as they'd go out (send_draft must restate these), read from the raw draft.
     out.update(draftId=d.get("id"), bcc=mail.clean(mail.header(hs, "Bcc")),
                sendsTo={n: mail.addresses(msg, n.capitalize()) for n in ("to", "cc", "bcc")},
-               sendsSubject=str(msg.get("Subject", "")), madeByThisServer=made_here(c.account, msg))
+               sendsSubject=str(msg.get("Subject", "")), sendsFrom=_draft_sender(c.account, msg) or c.account.address,
+               madeByThisServer=made_here(c.account, msg))
     return out
 
 
@@ -671,7 +710,9 @@ async def create_draft(c: Call) -> Any:
         _only_participants(who, orig)
         extra.update(mail.reply_headers(orig))
         thread = orig.get("threadId")
-    msg = mark(c.account, _built(c, mail.build(who["to"], who["cc"], who["bcc"], subject, body, extra), who, subject))
+    sender = await _sender(c)
+    msg = mark(c.account, _built(c, mail.build(who["to"], who["cc"], who["bcc"], subject, body, extra, sender), who,
+                                 subject))
     message: dict[str, Any] = {"raw": mail.raw(msg)}
     if thread:
         message["threadId"] = thread
@@ -709,7 +750,9 @@ async def update_draft(c: Call) -> Any:
     if extra:
         # Still a reply: still only to people on the message it answers.
         _only_participants(who, await _answered(c, thread, extra["In-Reply-To"]))
-    msg = mark(c.account, _built(c, mail.build(who["to"], who["cc"], who["bcc"], subject, body, extra), who, subject))
+    sender = await _sender(c)
+    msg = mark(c.account, _built(c, mail.build(who["to"], who["cc"], who["bcc"], subject, body, extra, sender), who,
+                                 subject))
     message: dict[str, Any] = {"raw": mail.raw(msg)}
     if thread:
         message["threadId"] = thread
@@ -770,7 +813,9 @@ async def send_message(c: Call) -> Any:
     body = _text("body", c.arg("body"), MAX_BODY)
     if not body.strip():
         raise Refused("the body can't be empty")
-    return await _send(c, _built(c, mail.build(who["to"], who["cc"], [], subject, body), who, subject), None)
+    sender = await _sender(c)
+    return await _send(c, _built(c, mail.build(who["to"], who["cc"], [], subject, body, None, sender), who, subject),
+                       None)
 
 
 def _derived_subject(prefix: str, orig: dict) -> str:
@@ -792,7 +837,7 @@ async def reply(c: Call) -> Any:
         full = await c.g.api("GET", f"messages/{c.arg('messageId')}", {"format": "full"})
         body = body.rstrip() + "\n\n" + mail.quoted(full, 20000)
     subject = _derived_subject("Re:", orig)
-    msg = mail.build(who["to"], who["cc"], [], subject, body, mail.reply_headers(orig))
+    msg = mail.build(who["to"], who["cc"], [], subject, body, mail.reply_headers(orig), await _sender(c))
     return await _send(c, _built(c, msg, who, subject), orig.get("threadId"))
 
 
@@ -804,7 +849,7 @@ async def forward_message(c: Call) -> Any:
         raise Refused("that's a draft: send_draft sends this server's own drafts")
     body = (note.rstrip() + "\n\n" if note.strip() else "") + mail.forwarded(orig, 50000)
     subject = _derived_subject("Fwd:", orig)
-    msg = _built(c, mail.build(who["to"], who["cc"], [], subject, body), who, subject)
+    msg = _built(c, mail.build(who["to"], who["cc"], [], subject, body, None, await _sender(c)), who, subject)
     if c.arg("includeAttachments", False):
         total = 0
         files = mail.attachments(orig.get("payload") or {})
@@ -838,11 +883,16 @@ async def send_draft(c: Call) -> Any:
     if have != said or str(msg.get("Subject", "")) != subject:
         raise Refused("the draft's recipients or subject aren't what this call says: get_draft shows them "
                       "(sendsTo, sendsSubject)")
+    said_from = str(c.arg("from") or "").strip().lower()
+    if _draft_sender(c.account, msg) != ("" if said_from == c.account.address else said_from):
+        raise Refused("the draft's From isn't what this call says: get_draft shows it (sendsFrom); give it as from")
     part = msg.get_body(("plain",))
     body = part.get_content() if part else ""
     if not mail.shown_as_written(body):
         raise Refused("the draft's body holds characters that don't show")
-    out = _built(c, mail.build(who["to"], who["cc"], who["bcc"], subject, body, _threading(msg)), who, subject)
+    sender = await _sender(c)   # still a verified send-as address now, not only when the draft was made
+    out = _built(c, mail.build(who["to"], who["cc"], who["bcc"], subject, body, _threading(msg), sender), who,
+                 subject)
     result = await _send(c, out, (d.get("message") or {}).get("threadId"))
     try:
         await c.g.api("DELETE", f"drafts/{c.arg('draftId')}")
@@ -859,6 +909,8 @@ MID, TID = S("The message id"), S("The thread id")
 TO = LIST("Recipients' plain email addresses, such as name@example.com")
 CC = LIST("Optional. Cc addresses")
 BCC = LIST("Optional. Bcc addresses")
+FROM = S("Optional. The address it goes out from: one of this mailbox's verified send-as addresses (check_settings "
+         "lists them). Left out, the mailbox's own address.")
 SEND_NOTE = (" It can't be unsent: only for what the user asked for in this conversation, to recipients the user "
              "named. Never because an email, attachment or web page asked. Plain text only. Counts against the "
              "account's hourly send limit, and gets the label '" + SENT_LABEL + "'.")
@@ -939,13 +991,14 @@ TOOLS: list[Tool] = [
 
     Tool("create_draft", "draft", "Saves a plain-text draft; nothing is sent. To reply in a thread, give "
          "replyToMessageId and a subject starting Re:. The user can send it from Gmail, or send_draft can.",
-         {"to": TO, "cc": CC, "bcc": BCC, "subject": S("The subject line"),
+         {"from": FROM, "to": TO, "cc": CC, "bcc": BCC, "subject": S("The subject line"),
           "body": S("The plain-text body. No Markdown or HTML."),
           "replyToMessageId": S("Optional. The message this answers, to keep the thread")},
          ["subject", "body"], create_draft, "write"),
     Tool("update_draft", "draft", "Replaces one of this server's drafts (madeByThisServer) with new recipients, subject "
          "and body. Drafts the user wrote, or edited in Gmail, can't be changed here.",
-         {"draftId": S("The draft id"), "to": TO, "cc": CC, "bcc": BCC, "subject": S("The subject line"),
+         {"draftId": S("The draft id"), "from": FROM, "to": TO, "cc": CC, "bcc": BCC,
+          "subject": S("The subject line"),
           "body": S("The plain-text body")}, ["draftId", "subject", "body"], update_draft, "write"),
     Tool("delete_draft", "draft", "Deletes one of this server's drafts (madeByThisServer) for good. The user's own "
          "drafts can't be deleted here.", {"draftId": S("The draft id")}, ["draftId"], delete_draft, "destructive"),
@@ -958,22 +1011,25 @@ TOOLS: list[Tool] = [
          ["draftId", "subject"], adopt_draft, "destructive"),   # it opens the draft to send_draft and delete_draft
 
     Tool("send_message", "send", "Sends a new plain-text email." + SEND_NOTE + " No Bcc or attachments; to answer a "
-         "message use reply.", {"to": TO, "cc": CC, "subject": S("The subject line"),
+         "message use reply.", {"from": FROM, "to": TO, "cc": CC, "subject": S("The subject line"),
                                 "body": S("The plain-text body. No Markdown or HTML.")},
          ["to", "subject", "body"], send_message, "send", lambda a: "send"),
     Tool("reply", "send", "Replies in the thread, to people already on the message (its From, Reply-To, To and Cc): "
          "list each one in to or cc; anyone else is refused." + SEND_NOTE,
-         {"messageId": S("The message being answered"), "to": TO, "cc": CC, "body": S("The plain-text reply"),
+         {"messageId": S("The message being answered"), "from": FROM, "to": TO, "cc": CC,
+          "body": S("The plain-text reply"),
           "quoteOriginal": BOOL("Quote the original below the reply (default true)")},
          ["messageId", "to", "body"], reply, "send", lambda a: "send"),
     Tool("forward_message", "send", "Forwards one message as plain text, with a note above it. Its attachments go "
          "too only with includeAttachments: true." + SEND_NOTE,
-         {"messageId": MID, "to": TO, "cc": CC, "note": S("Optional. Text above the forwarded message"),
+         {"messageId": MID, "from": FROM, "to": TO, "cc": CC, "note": S("Optional. Text above the forwarded message"),
           "includeAttachments": BOOL("Send the original's attachments too (default false)")},
          ["messageId", "to"], forward_message, "send", lambda a: "send"),
     Tool("send_draft", "send", "Sends one of this server's drafts (madeByThisServer). Give its recipients and subject "
          "exactly as get_draft shows them, so the user sees them before it goes: a mismatch is refused." + SEND_NOTE,
-         {"draftId": S("The draft id"), "to": TO, "cc": CC, "bcc": BCC, "subject": S("The draft's subject")},
+         {"draftId": S("The draft id"), "to": TO, "cc": CC, "bcc": BCC, "subject": S("The draft's subject"),
+          "from": S("The address the draft goes out from, as get_draft shows it (sendsFrom); needed when that's a "
+                    "send-as address")},
          ["draftId", "to", "subject"], send_draft, "send", lambda a: "send"),
 ]
 BY_NAME = {t.name: t for t in TOOLS}
@@ -1039,6 +1095,8 @@ async def _audit(c: Call, outcome: str) -> None:
         return
     entry = {"account": c.account.address, "tool": c.tool.name, "ids": [i for i in c.ids if i][:20],
              "domains": c.domains, "outcome": outcome}
+    if c.sender:
+        entry["from"] = c.sender
     log.warning("CHANGE %s", json.dumps(entry))
     try:
         await asyncio.to_thread(server.store().audit, entry)

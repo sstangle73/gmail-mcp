@@ -422,9 +422,12 @@ def participants(msg: dict[str, Any]) -> set[str]:
 # Building messages.
 
 def build(to: list[str], cc: list[str], bcc: list[str], subject: str, body: str,
-          extra: dict[str, str] | None = None) -> EmailMessage:
-    """A plain-text, UTF-8 message. No From: Gmail sets the account's own address."""
+          extra: dict[str, str] | None = None, sender: str | None = None) -> EmailMessage:
+    """A plain-text, UTF-8 message. With no sender there's no From, and Gmail sets the account's own address;
+    sender is a From header value for one of the account's verified send-as addresses (tools._sender)."""
     msg = EmailMessage(policy=policy.SMTP)
+    if sender:
+        msg["From"] = sender
     if to:
         msg["To"] = ", ".join(to)
     if cc:
@@ -450,10 +453,15 @@ def addresses(msg: EmailMessage, name: str) -> list[str]:
     return [a.strip().lower() for _, a in getaddresses([str(v) for v in msg.get_all(name, [])]) if a.strip()]
 
 
-def built_problem(msg: EmailMessage, to: list[str], cc: list[str], bcc: list[str], subject: str) -> str | None:
+def built_problem(msg: EmailMessage, to: list[str], cc: list[str], bcc: list[str], subject: str,
+                  sender: str | None = None) -> str | None:
     """Why msg, read back the way a mail server reads it, isn't exactly what was approved; None when it is. Python
-    decodes encoded words when it writes a header, so the approved strings alone prove nothing."""
+    decodes encoded words when it writes a header, so the approved strings alone prove nothing. sender is the
+    approved From address, or None for none at all (Gmail then sets the account's own)."""
     back = BytesParser(policy=policy.default).parsebytes(msg.as_bytes())
+    got_from = addresses(back, "From")
+    if got_from != ([sender.strip().lower()] if sender else []):
+        return f"it would go out from {', '.join(got_from) or 'the mailbox itself'}, not as given"
     for name, want in (("To", to), ("Cc", cc), ("Bcc", bcc)):
         got = addresses(back, name)
         if sorted(got) != sorted(a.strip().lower() for a in want):
@@ -463,13 +471,16 @@ def built_problem(msg: EmailMessage, to: list[str], cc: list[str], bcc: list[str
     return None
 
 
-def fingerprint(msg: EmailMessage, marker: str) -> bytes:
-    """A draft's content as the server signs it: recipients, subject, threading headers and plain-text body, all
-    but the marker header. Read the same way from a message just built and from one fetched back from Gmail."""
+def fingerprint(msg: EmailMessage, marker: str, own: str = "") -> bytes:
+    """A draft's content as the server signs it: the From address, recipients, subject, threading headers and every
+    part, all but the marker header. Read the same way from a message just built and from one fetched back from
+    Gmail. Gmail writes a From with the mailbox's own address (own) on every draft it stores, so that address counts
+    as no From: only a send-as alias is signed."""
     back = BytesParser(policy=policy.default).parsebytes(msg.as_bytes())
     part = back.get_body(("plain",))
     body = part.get_content() if part else ""
-    doc = {"to": sorted(addresses(back, "To")), "cc": sorted(addresses(back, "Cc")),
+    sender = [a for a in addresses(back, "From") if a != own.strip().lower()]
+    doc = {"from": sender, "to": sorted(addresses(back, "To")), "cc": sorted(addresses(back, "Cc")),
            "bcc": sorted(addresses(back, "Bcc")), "subject": str(back.get("Subject", "")),
            "in-reply-to": str(back.get("In-Reply-To", "")), "references": str(back.get("References", "")),
            "body": body.replace("\r\n", "\n").rstrip("\n"), "parts": sum(1 for _ in back.walk()),
