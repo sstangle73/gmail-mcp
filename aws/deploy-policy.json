@@ -1,0 +1,30 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {"Sid": "ReadTheRole", "Effect": "Allow", "Action": ["iam:GetRole", "iam:GetRolePolicy"],
+     "Resource": "arn:aws:iam::*:role/gmail-mcp-lambda"},
+    {"Sid": "PassTheRoleToLambdaOnly", "Effect": "Allow", "Action": "iam:PassRole",
+     "Resource": "arn:aws:iam::*:role/gmail-mcp-lambda",
+     "Condition": {"StringEquals": {"iam:PassedToService": "lambda.amazonaws.com"}}},
+    {"Sid": "TheFunction", "Effect": "Allow",
+     "Action": ["lambda:GetFunction", "lambda:GetFunctionConfiguration", "lambda:CreateFunction",
+                "lambda:UpdateFunctionCode", "lambda:UpdateFunctionConfiguration", "lambda:TagResource",
+                "lambda:GetFunctionUrlConfig", "lambda:CreateFunctionUrlConfig", "lambda:GetPolicy",
+                "lambda:AddPermission", "lambda:GetFunctionConcurrency", "lambda:PutFunctionConcurrency",
+                "lambda:DeleteFunctionConcurrency"],
+     "Resource": "arn:aws:lambda:*:*:function:gmail-mcp"},
+    {"Sid": "TheStateTable", "Effect": "Allow",
+     "Action": ["dynamodb:DescribeTable", "dynamodb:CreateTable", "dynamodb:DescribeTimeToLive",
+                "dynamodb:UpdateTimeToLive", "dynamodb:TagResource"],
+     "Resource": "arn:aws:dynamodb:*:*:table/gmail-mcp-state"},
+    {"Sid": "WriteItsParameters", "Effect": "Allow", "Action": "ssm:PutParameter",
+     "Resource": "arn:aws:ssm:*:*:parameter/gmail-mcp/*"},
+    {"Sid": "ListParameterNames", "Effect": "Allow", "Action": "ssm:DescribeParameters", "Resource": "*"},
+    {"Sid": "SecureStringsThroughSsm", "Effect": "Allow", "Action": ["kms:Encrypt", "kms:GenerateDataKey"],
+     "Resource": "*", "Condition": {"StringLike": {"kms:ViaService": "ssm.*.amazonaws.com"}}},
+    {"Sid": "ItsLogGroup", "Effect": "Allow", "Action": ["logs:CreateLogGroup", "logs:PutRetentionPolicy"],
+     "Resource": ["arn:aws:logs:*:*:log-group:/aws/lambda/gmail-mcp",
+                  "arn:aws:logs:*:*:log-group:/aws/lambda/gmail-mcp:*"]},
+    {"Sid": "FindLogGroups", "Effect": "Allow", "Action": "logs:DescribeLogGroups", "Resource": "*"}
+  ]
+}

@@ -1,0 +1,16 @@
+# Secrets: Google refresh tokens read and send mail.
+.env
+data/
+client_secret_*.json
+signin.env
+google*.env
+
+# Which mailboxes this copy holds: personal, so not in the repository (accounts.example.json shows the shape).
+accounts.json
+
+# Build output and local tooling
+build/
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/

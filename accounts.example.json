@@ -1,0 +1,5 @@
+[
+  {"address": "me@example.com", "level": "send", "sendsPerHour": 10, "organisePerHour": 50},
+  {"address": "work@example.org", "level": "draft"},
+  {"address": "old@example.net", "level": "read"}
+]
