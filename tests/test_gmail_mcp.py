@@ -269,6 +269,31 @@ class Server(Http, unittest.TestCase):
                                        ip="198.51.100.7")[0], 401)
         self.assertEqual(seen, [1])
 
+    def test_parallel_wrong_sign_ins_respect_the_lockout(self):
+        # Guesses sent at once: only LOCKOUT_FAILURES get their password checked, the rest are refused unchecked.
+        from types import SimpleNamespace
+        request = self.signin_request(secrets.token_urlsafe(48))
+        checked = []
+
+        def check(password, stored):
+            checked.append(password)
+            time.sleep(0.01)
+            return False
+
+        class Post:
+            method = "POST"
+            client = SimpleNamespace(host="198.51.100.20")
+
+            async def form(self):
+                return {"request": request, "password": "wrong", "code": "000000"}
+
+        async def burst():
+            return await asyncio.gather(*(self.provider.signin(Post()) for _ in range(oauth.LOCKOUT_FAILURES + 5)))
+        with mock.patch.object(oauth, "check_password", check):
+            responses = self.lh._loop.run_until_complete(burst())
+        self.assertEqual(len(checked), oauth.LOCKOUT_FAILURES)
+        self.assertEqual(sorted(r.status_code for r in responses), [401] * oauth.LOCKOUT_FAILURES + [429] * 5)
+
     def test_sign_in_fails_closed_when_the_table_is_down(self):
         request = self.signin_request(secrets.token_urlsafe(48))
         server.store().down = True
